@@ -1,0 +1,594 @@
+# 🚦 Non‑custodial Gateway API — v2 (Stripe + PayPal + BTCPay + EVM + Prisma)
+
+Open‑source scaffold that pairs with the mock UI. This version adds:
+
+* **PayPal Orders (Checkout)** + **PayPal Payouts** (direct‑to‑recipient)
+* **EVM rail** (WalletConnect/any wallet) returning a **USDC transfer payload**
+* **Postgres schema with Prisma** for `payments` and `events` (auditable, non‑custodial)
+
+> Your gateway **never holds funds**. It only creates payment intents on external rails and listens for webhooks.
+
+---
+
+## 📂 File tree
+
+```
+noncustodial-gateway/
+├─ package.json
+├─ .env.example
+├─ prisma/
+│  └─ schema.prisma
+├─ src/
+│  ├─ server.js
+│  ├─ recipients.js
+│  ├─ db/
+│  │  └─ prisma.js
+│  ├─ rails/
+│  │  ├─ stripe.js
+│  │  ├─ paypal.js
+│  │  ├─ btcpay.js
+│  │  └─ evm.js
+│  └─ webhooks/
+│     ├─ stripe.js
+│     ├─ btcpay.js
+│     └─ paypal.js
+```
+
+---
+
+## ⚙️ `.env.example`
+
+```env
+# App
+PORT=3000
+CORS_ORIGIN=http://localhost:5173
+
+# Stripe
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+SUCCESS_URL=http://localhost:5173/success
+CANCEL_URL=http://localhost:5173/cancel
+
+# BTCPay Server
+BTCPAY_URL=https://your-btcpay.example
+BTCPAY_API_KEY=your_api_key
+BTCPAY_STORE_ID=your_store_id
+BTCPAY_WEBHOOK_SECRET=supersecret
+
+# PayPal
+PAYPAL_ENV=sandbox # or 'live'
+PAYPAL_CLIENT_ID=...
+PAYPAL_CLIENT_SECRET=...
+PAYPAL_WEBHOOK_ID=...
+
+# Database (Postgres)
+DATABASE_URL=postgresql://user:pass@localhost:5432/gateway?schema=public
+
+# EVM / USDC
+EVM_CHAIN_ID=137 # Polygon mainnet, e.g., 137; Sepolia=11155111; Polygon Amoy=80002
+USDC_CONTRACT=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174 # USDC on Polygon
+```
+
+---
+
+## 📦 `package.json`
+
+```json
+{
+  "name": "noncustodial-gateway",
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "db:gen": "prisma generate",
+    "db:push": "prisma db push"
+  },
+  "dependencies": {
+    "@paypal/checkout-server-sdk": "^1.0.3",
+    "@paypal/payouts-sdk": "^1.0.3",
+    "@prisma/client": "^5.18.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2",
+    "express": "^4.19.2",
+    "raw-body": "^2.5.2",
+    "stripe": "^16.4.0",
+    "undici": "^6.19.8"
+  },
+  "devDependencies": {
+    "prisma": "^5.18.0"
+  }
+}
+```
+
+---
+
+## 🗄️ `prisma/schema.prisma`
+
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Payment {
+  id           String   @id @default(cuid())
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  rail         String
+  amount       Int      // minor units (e.g., cents)
+  currency     String
+  recipientId  String
+  description  String?
+  externalRef  String?  // sessionId, orderId, invoiceId, txHash, etc.
+  status       String   // created|pending|succeeded|failed|canceled
+  metadata     Json?
+
+  events       Event[]
+
+  @@index([rail])
+  @@index([recipientId])
+  @@index([externalRef])
+}
+
+model Event {
+  id         String   @id @default(cuid())
+  createdAt  DateTime @default(now())
+  source     String   // stripe|paypal|btcpay|evm
+  type       String
+  payload    Json
+
+  payment    Payment? @relation(fields: [paymentId], references: [id])
+  paymentId  String?
+
+  @@index([source])
+  @@index([type])
+}
+```
+
+---
+
+## 🧩 `src/db/prisma.js`
+
+```js
+import { PrismaClient } from '@prisma/client';
+export const prisma = new PrismaClient();
+```
+
+---
+
+## 👥 `src/recipients.js`
+
+```js
+// Minimal registry — swap for DB lookups in production
+export const RECIPIENTS = [
+  { id: 'r_stripe_1', name: 'Veekle Marketplace', rails: ['stripe'], connectAccountId: 'acct_12345' },
+  { id: 'r_paypal_1', name: "Vendor – Gracie's Hope", rails: ['paypal'], paypalEmail: 'payouts@gracieshope.com' },
+  { id: 'r_crypto_1', name: 'Creator – Aria Nova', rails: ['evm'], walletAddress: '0xA1b2C3d4E5f6A7b8C9d0e1F2A3b4C5d6E7f8A9B0' }
+];
+
+export function getRecipient(id) {
+  return RECIPIENTS.find(r => r.id === id);
+}
+```
+
+---
+
+## 💳 `src/rails/stripe.js` (unchanged from v1)
+
+```js
+import Stripe from 'stripe';
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+
+export async function createStripeCheckout({ amount, currency, description, recipient }) {
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    currency,
+    line_items: [{ price_data: { currency, product_data: { name: description || 'Payment' }, unit_amount: amount }, quantity: 1 }],
+    success_url: process.env.SUCCESS_URL,
+    cancel_url: process.env.CANCEL_URL,
+    payment_intent_data: { transfer_data: { destination: recipient.connectAccountId } }
+  });
+  return { redirect: session.url, sessionId: session.id };
+}
+```
+
+---
+
+## 🅿️ `src/rails/paypal.js`
+
+```js
+import paypal from '@paypal/checkout-server-sdk';
+import { v4 as uuidv4 } from 'uuid';
+
+function client() {
+  const Env = process.env.PAYPAL_ENV === 'live' ? paypal.core.LiveEnvironment : paypal.core.SandboxEnvironment;
+  const env = new Env(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_CLIENT_SECRET);
+  return new paypal.core.PayPalHttpClient(env);
+}
+
+export async function createPayPalOrder({ amount, currency, description, recipient }) {
+  const request = new paypal.orders.OrdersCreateRequest();
+  request.prefer('return=representation');
+  request.requestBody({
+    intent: 'CAPTURE',
+    purchase_units: [
+      {
+        amount: { currency_code: currency.toUpperCase(), value: (amount / 100).toFixed(2) },
+        payee: { email_address: recipient.paypalEmail }, // direct to recipient
+        description: description || 'Payment'
+      }
+    ],
+    application_context: {
+      brand_name: 'Your Gateway',
+      user_action: 'PAY_NOW',
+      return_url: process.env.SUCCESS_URL,
+      cancel_url: process.env.CANCEL_URL
+    }
+  });
+
+  const resp = await client().execute(request);
+  const approve = resp.result.links?.find(l => l.rel === 'approve')?.href;
+  return { orderId: resp.result.id, redirect: approve };
+}
+
+// Optional server-initiated capture after approval redirect flow (if you aren't using webhooks)
+export async function capturePayPalOrder(orderId) {
+  const request = new paypal.orders.OrdersCaptureRequest(orderId);
+  request.requestBody({});
+  const resp = await client().execute(request);
+  return resp.result;
+}
+
+// Payouts — send money directly to a PayPal account (non-custodial to you)
+import payouts from '@paypal/payouts-sdk';
+function payoutsClient() {
+  const Env = process.env.PAYPAL_ENV === 'live' ? paypal.core.LiveEnvironment : paypal.core.SandboxEnvironment;
+  const env = new Env(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_CLIENT_SECRET);
+  return new paypal.core.PayPalHttpClient(env);
+}
+
+export async function sendPayPalPayout({ amount, currency, receiverEmail, note }) {
+  const req = new payouts.payouts.PayoutsPostRequest();
+  req.requestBody({
+    sender_batch_header: { sender_batch_id: uuidv4(), email_subject: 'You have a payout!' },
+    items: [
+      {
+        recipient_type: 'EMAIL',
+        amount: { value: (amount / 100).toFixed(2), currency: currency.toUpperCase() },
+        receiver: receiverEmail,
+        note: note || 'Payout',
+        sender_item_id: uuidv4()
+      }
+    ]
+  });
+  const resp = await payoutsClient().execute(req);
+  return resp.result;
+}
+```
+
+---
+
+## ₿ `src/rails/btcpay.js` (same as v1)
+
+```js
+import { request } from 'undici';
+const BTCPAY_URL = process.env.BTCPAY_URL;
+const STORE_ID = process.env.BTCPAY_STORE_ID;
+const API_KEY = process.env.BTCPAY_API_KEY;
+
+export async function createBTCPayInvoice({ amount, currency, description, metadata }) {
+  const url = `${BTCPAY_URL}/api/v1/stores/${STORE_ID}/invoices`;
+  const body = { amount: (amount / 100).toFixed(2), currency: currency.toUpperCase(), metadata: { description, ...metadata } };
+  const { body: resBody } = await request(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `token ${API_KEY}` }, body: JSON.stringify(body) });
+  const inv = await resBody.json();
+  return { redirect: inv.checkoutLink, invoiceId: inv.id };
+}
+```
+
+---
+
+## ⛽ `src/rails/evm.js`
+
+```js
+import { Interface, getAddress, parseUnits } from 'ethers';
+
+const ERC20_ABI = [ 'function transfer(address to, uint256 amount) returns (bool)' ];
+const iface = new Interface(ERC20_ABI);
+
+function decimalsFor(symbol) {
+  // Simplify: default to 6 for USDC; extend as needed
+  if (symbol.toUpperCase() === 'USDC') return 6;
+  return 18;
+}
+
+export function buildUsdcTransferPayload({ amount, currency, recipient, tokenAddress, chainId }) {
+  const dec = decimalsFor('USDC');
+  const amt = parseUnits(String(amount / 100), dec); // interpret given minor units as whole USDC here for demo
+  const data = iface.encodeFunctionData('transfer', [ getAddress(recipient.walletAddress), amt ]);
+  return {
+    chainId: Number(chainId),
+    to: tokenAddress, // token contract
+    data,
+    value: '0x0' // ERC20 transfer
+  };
+}
+```
+
+> **Note:** In production, map your fiat `amount` and currency to the right USDC decimal logic and FX conversion before building the ERC20 payload.
+
+---
+
+## 🌐 `src/webhooks/paypal.js`
+
+```js
+// Minimal webhook handler — verify via PayPal's transmission headers or capture via return flow.
+// For brevity, this demo trusts payload and logs events. Implement full verification for production.
+export async function paypalWebhookHandler(req, res) {
+  try {
+    const event = req.body; // contains event_type, resource, etc.
+    console.log('✅ PayPal event', event.event_type);
+    // Examples: CHECKOUT.ORDER.APPROVED, PAYMENT.CAPTURE.COMPLETED
+    res.sendStatus(200);
+  } catch (e) {
+    console.error('PayPal webhook error', e);
+    res.sendStatus(500);
+  }
+}
+```
+
+> **Production:** Verify PayPal webhooks using `transmission_id`, `transmission_time`, `transmission_sig`, and the `cert_url` JWS as per PayPal docs.
+
+---
+
+## 🖥️ `src/server.js` (wired rails + Prisma logging)
+
+```js
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import bodyParser from 'body-parser';
+import getRawBody from 'raw-body';
+
+import { prisma } from './db/prisma.js';
+import { getRecipient } from './recipients.js';
+import { createStripeCheckout } from './rails/stripe.js';
+import { createPayPalOrder, capturePayPalOrder, sendPayPalPayout } from './rails/paypal.js';
+import { createBTCPayInvoice } from './rails/btcpay.js';
+import { buildUsdcTransferPayload } from './rails/evm.js';
+import { stripeWebhookHandler } from './webhooks/stripe.js';
+import { btcpayWebhookHandler } from './webhooks/btcpay.js';
+import { paypalWebhookHandler } from './webhooks/paypal.js';
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors({ origin: process.env.CORS_ORIGIN?.split(',') || true }));
+app.use(bodyParser.json({ limit: '1mb' }));
+
+// Health
+app.get('/health', (_, res) => res.json({ ok: true }));
+
+// Create a payment across rails (Stripe | PayPal | BTCPay | EVM)
+app.post('/pay', async (req, res) => {
+  try {
+    const { amount, currency = 'USD', rail, recipientId, description, metadata } = req.body || {};
+    if (!amount || !recipientId || !rail) return res.status(400).json({ error: 'amount, currency, rail, recipientId required' });
+
+    const recipient = getRecipient(recipientId);
+    if (!recipient) return res.status(404).json({ error: 'Recipient not found' });
+
+    // Create DB record (status: created)
+    const payment = await prisma.payment.create({ data: { rail, amount, currency, recipientId, description, status: 'created', metadata } });
+
+    if (rail === 'stripe') {
+      const out = await createStripeCheckout({ amount, currency, description, recipient });
+      await prisma.payment.update({ where: { id: payment.id }, data: { externalRef: out.sessionId, status: 'pending' } });
+      return res.json({ id: payment.id, rail, ...out });
+    }
+
+    if (rail === 'paypal') {
+      const out = await createPayPalOrder({ amount, currency, description, recipient });
+      await prisma.payment.update({ where: { id: payment.id }, data: { externalRef: out.orderId, status: 'pending' } });
+      return res.json({ id: payment.id, rail, ...out });
+    }
+
+    if (rail === 'btcpay') {
+      const out = await createBTCPayInvoice({ amount, currency, description, metadata: { recipientId } });
+      await prisma.payment.update({ where: { id: payment.id }, data: { externalRef: out.invoiceId, status: 'pending' } });
+      return res.json({ id: payment.id, rail, ...out });
+    }
+
+    if (rail === 'evm') {
+      const payload = buildUsdcTransferPayload({
+        amount,
+        currency,
+        recipient,
+        tokenAddress: process.env.USDC_CONTRACT,
+        chainId: process.env.EVM_CHAIN_ID
+      });
+      await prisma.payment.update({ where: { id: payment.id }, data: { status: 'pending' } });
+      return res.json({ id: payment.id, rail, payload });
+    }
+
+    return res.status(400).json({ error: 'Unsupported rail' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error', detail: e.message });
+  }
+});
+
+// Optional capture endpoint for PayPal after return_url redirect
+app.post('/paypal/capture', async (req, res) => {
+  try {
+    const { orderId, paymentId } = req.body;
+    const result = await capturePayPalOrder(orderId);
+    await prisma.event.create({ data: { source: 'paypal', type: 'order.capture', payload: result, paymentId } });
+    await prisma.payment.update({ where: { id: paymentId }, data: { status: 'succeeded' } });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'capture failed', detail: e.message });
+  }
+});
+
+// PayPal Payouts demo
+app.post('/payouts/paypal', async (req, res) => {
+  try {
+    const { amount, currency = 'USD', receiverEmail, note } = req.body;
+    const out = await sendPayPalPayout({ amount, currency, receiverEmail, note });
+    res.json(out);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'payout failed', detail: e.message });
+  }
+});
+
+// Stripe: raw body required
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  await stripeWebhookHandler(req, res);
+});
+
+// BTCPay & PayPal: normal JSON
+app.post('/webhooks/btcpay', express.json(), async (req, res) => {
+  await btcpayWebhookHandler(req, res);
+});
+app.post('/webhooks/paypal', express.json(), async (req, res) => {
+  await paypalWebhookHandler(req, res);
+});
+
+app.listen(PORT, () => console.log(`Gateway listening on :${PORT}`));
+```
+
+---
+
+## 🧪 Quick test (cURL)
+
+```bash
+# PayPal — create order (redirect URL in response)
+curl -s -X POST http://localhost:3000/pay \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "amount": 2500,
+    "currency": "USD",
+    "rail": "paypal",
+    "recipientId": "r_paypal_1",
+    "description": "Order #P-1001"
+  }' | jq
+
+# EVM — USDC transfer payload (send via wallet)
+curl -s -X POST http://localhost:3000/pay \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "amount": 5000,
+    "currency": "USD",
+    "rail": "evm",
+    "recipientId": "r_crypto_1",
+    "description": "Tip"
+  }' | jq
+
+# PayPal Payout (direct to email)
+curl -s -X POST http://localhost:3000/payouts/paypal \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "amount": 1000,
+    "currency": "USD",
+    "receiverEmail": "payouts@gracieshope.com",
+    "note": "Creator revenue share"
+  }' | jq
+```
+
+---
+
+## 🧱 Minimal Solidity escrow (optional add‑on)
+
+```solidity
+// contracts/SimpleEscrow.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 { function transferFrom(address,address,uint256) external returns (bool); function transfer(address,uint256) external returns (bool); }
+
+contract SimpleEscrow {
+    address public arbiter; // marketplace arbiter (optional)
+    struct Deal { address payer; address payee; IERC20 token; uint256 amount; bool funded; bool released; }
+    mapping(bytes32 => Deal) public deals; // id => deal
+
+    event Funded(bytes32 indexed id, address indexed payer, address indexed payee, uint256 amount);
+    event Released(bytes32 indexed id, address indexed payee);
+    event Refunded(bytes32 indexed id, address indexed payer);
+
+    constructor(address _arbiter) { arbiter = _arbiter; }
+
+    function fund(bytes32 id, address payee, address token, uint256 amount) external {
+        require(!deals[id].funded, "already funded");
+        deals[id] = Deal(msg.sender, payee, IERC20(token), amount, true, false);
+        require(IERC20(token).transferFrom(msg.sender, address(this), amount), "transferFrom failed");
+        emit Funded(id, msg.sender, payee, amount);
+    }
+
+    function release(bytes32 id) external {
+        Deal storage d = deals[id];
+        require(d.funded && !d.released, "bad state");
+        require(msg.sender == d.payer || msg.sender == arbiter, "not authorized");
+        d.released = true;
+        require(d.token.transfer(d.payee, d.amount), "transfer failed");
+        emit Released(id, d.payee);
+    }
+
+    function refund(bytes32 id) external {
+        Deal storage d = deals[id];
+        require(d.funded && !d.released, "bad state");
+        require(msg.sender == d.payee || msg.sender == arbiter, "not authorized");
+        require(d.token.transfer(d.payer, d.amount), "transfer failed");
+        delete deals[id];
+        emit Refunded(id, d.payer);
+    }
+}
+```
+
+**When to use escrow:** only when business logic requires a hold + decision. Otherwise prefer direct wallet → wallet via the USDC transfer payload above.
+
+---
+
+## 🔌 Pairing with the existing UI
+
+Your mock UI already has tabs for PayPal and Crypto. Point the **Pay** button to `POST /pay`:
+
+* If `rail === 'paypal'` → redirect to `response.redirect`
+* If `rail === 'evm'` → open WalletConnect/MetaMask with the returned `{ chainId, to, data, value }`
+
+Example wallet call (client):
+
+```ts
+// EIP-155 request
+await window.ethereum.request({
+  method: 'eth_sendTransaction',
+  params: [{
+    from: userAddress,
+    to: payload.to,
+    data: payload.data,
+    value: payload.value
+  }]
+});
+```
+
+---
+
+## 🚀 Run it
+
+```bash
+npm i
+npx prisma generate
+npx prisma db push
+cp .env.example .env # fill values
+npm run dev
+```
+
+That’s it — you’ve got **Stripe + PayPal + BTCPay + EVM (USDC)** in one non‑custodial gateway, with a real database log. Extend as needed, and plug straight into your UI. 💥
